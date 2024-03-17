@@ -1,9 +1,9 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-pub fn hash(str: String, n: &i32) -> i32 {
+pub fn hash(str: &String, n: &u32) -> u32 {
     let mut hasher = DefaultHasher::new();
     str.hash(&mut hasher);
-    let result = hasher.finish() as i32;
+    let result = hasher.finish() as u32;
     result % n
 }
 
@@ -16,6 +16,6 @@ mod tests {
         let string1 = "foo".to_string();
         let string2 = "foo".to_string();
         let n = 5;
-        assert_eq!(hash(string1, &n), hash(string2, &n));
+        assert_eq!(hash(&string1, &n), hash(&string2, &n));
     }
 }
