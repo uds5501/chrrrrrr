@@ -4,15 +4,15 @@ use std::hash::Hash;
 use std::sync::{RwLock};
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::{AcqRel, Acquire};
-use crate::hash::hash;
+use crate::core::hash::hash;
 
-struct Node {
+pub(crate) struct Node {
     store: RwLock<HashMap<String, String>>,
     key_count: AtomicU32,
 }
 
 impl Node {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             store: RwLock::new(Default::default()),
             key_count: AtomicU32::new(0),
@@ -63,8 +63,8 @@ impl Node {
 mod tests {
     use std::collections::HashMap;
     use std::thread::{scope};
-    use crate::hash::hash;
-    use crate::node::Node;
+    use crate::core::hash::hash;
+    use crate::core::node::Node;
 
     #[test]
     fn test_single_threaded_inserts() {

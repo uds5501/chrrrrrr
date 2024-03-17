@@ -9,7 +9,7 @@ pub fn hash(str: &String, n: &u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use crate::hash::hash;
+    use crate::core::hash::hash;
 
     #[test]
     fn test_deterministic_hash() {
