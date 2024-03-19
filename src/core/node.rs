@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-use std::error::Error;
-use std::hash::Hash;
 use std::sync::{RwLock};
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::{AcqRel, Acquire};
@@ -108,7 +106,7 @@ mod tests {
                 let node = &node;
                 s.spawn(move || {
                     for i in 0..vals {
-                        if (thread_idx.clone() % 2 != 0) {
+                        if thread_idx.clone() % 2 != 0 {
                             thread_idx -= 1;
                         }
                         node.insert_key(format!("{thread_idx}-{i}"), format!("val: {thread_idx}-{i}"));

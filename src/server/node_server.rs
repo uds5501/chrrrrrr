@@ -6,26 +6,51 @@ use log::{debug, info};
 use crate::core::node::Node;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
-struct InsertResponse {
+pub(crate) struct InsertResponse {
     success: bool,
     message: String,
 }
 
+impl InsertResponse {
+    pub fn is_success(&self) -> bool {
+        self.success
+    }
+
+    pub fn new(success:bool, message: String) -> Self {
+        Self{ success, message }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
-struct InsertRequest {
+pub(crate) struct InsertRequest {
     key: String,
     value: String,
 }
+impl InsertRequest {
+    pub fn new(k: String, v: String) -> Self {
+        Self{
+            key: k,
+            value: v
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
-struct GetResponse {
+pub(crate) struct GetResponse {
     success: bool,
     message: String,
     value: String,
 }
 
+impl GetResponse {
+    pub fn is_success(&self) -> bool {self.success}
+    pub fn get_value(&self) -> String {self.value.clone()}
+    pub fn get_msg(&self) -> String {self.message.clone()}
+
+}
+
 async fn handle_insert(req: InsertRequest, node: Arc<Node>) -> Result<impl Reply, Rejection> {
-    let mut resp: InsertResponse;
+    let resp: InsertResponse;
     let key = req.clone().key;
     let val = req.clone().value;
     if node.insert_key(key, val) {
@@ -46,7 +71,7 @@ async fn handle_insert(req: InsertRequest, node: Arc<Node>) -> Result<impl Reply
 
 // Handler for the get endpoint
 async fn handle_get(key: String, node: Arc<Node>) -> Result<impl Reply, Rejection> {
-    let mut resp: GetResponse;
+    let resp: GetResponse;
     if let Some(val) = node.get(&key) {
         resp = GetResponse {
             success: true,
