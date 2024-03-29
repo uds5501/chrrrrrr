@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::error::Error;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::{AcqRel, Acquire};
 use async_trait::async_trait;
+use log::debug;
 use crate::core::hash::hash;
 use crate::clients::node_client::{NodeInteractions, NodeClient};
 use tokio::sync::RwLock;
@@ -36,6 +38,9 @@ impl AllocationMetadata {
     pub fn identify_idx_for_slot(&self, hash: u32) -> u32 {
         let mut low = 0;
         let mut high = self.acquired_slots.len();
+        if high == 0 {
+            return 0;
+        }
         while low <= high {
             let mid: usize = (low + high) / 2;
             if self.acquired_slots[mid] <= hash {
@@ -64,6 +69,9 @@ pub trait StorageInteractions {
 pub trait RegistrationInteractions {
     async fn register_node(&self, node: NodeClient) -> Result<bool, Box<dyn Error>>;
     async fn de_register_node(&self, node: NodeClient) -> Result<bool, Box<dyn Error>>;
+    async fn get_acquired_slots(&self) -> Result<Vec<u32>, Box<dyn Error>>;
+    async fn get_total_nodes(&self) -> Result<u32, Box<dyn Error>>;
+    async fn get_slot_node_map(&self) -> Result<HashMap<u32, NodeClient>, Box<dyn Error>>;
 }
 
 #[async_trait]
@@ -111,9 +119,29 @@ impl RegistrationInternals for Allocator {
         if metadata.acquired_slots.len() != 0 {
             let len = metadata.acquired_slots.len();
             let last_node_idx = metadata.acquired_slots[idx as usize % len];
+            let old_node = metadata.slot_node_map.get(&last_node_idx).unwrap();
+            let old_node_end_idx = metadata.identify_idx_for_slot(last_node_idx + 1);
+
+            // this could be done in background later on.
+            match old_node.fetch_migrated(slot, old_node_end_idx, metadata.total_slots).await {
+                Ok(kvs) => {
+                    if let Some(removed_kvs) = kvs {
+                        for (key, value) in removed_kvs.iter() {
+                            if !node.insert_key(key.clone(), value.clone()).await? {
+                                debug!("[migration] insertion of {}:{} failed in node : {}", &key, &value, &node.get_id())
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
         }
+
         self.nodes.fetch_add(1, AcqRel);
         metadata.acquired_slots.push(slot);
+        metadata.acquired_slots.sort();
         metadata.slot_node_map.insert(slot, node);
         Ok(true)
     }
@@ -122,20 +150,34 @@ impl RegistrationInternals for Allocator {
 #[async_trait]
 impl RegistrationInteractions for Allocator {
     async fn register_node(&self, node: NodeClient) -> Result<bool, Box<dyn Error>> {
-        let metadata = self.metadata.read().await;
-        if metadata.total_slots == metadata.acquired_slots.len() as u32 {
-            return Ok(false);
+        {
+            let metadata = self.metadata.read().await;
+            if metadata.total_slots == metadata.acquired_slots.len() as u32 {
+                return Ok(false);
+            }
+            let slot = hash(&node.get_id(), &metadata.total_slots);
+            if metadata.slot_node_map.contains_key(&slot) {
+                println!("New node {:?} can't be added as slot {slot} is already taken", node.get_id());
+                return Ok(false);
+            }
         }
-        let slot = hash(&node.get_id(), &metadata.total_slots);
-        if metadata.slot_node_map.contains_key(&slot) {
-            println!("New node {:?} can't be added as slot {slot} is already taken", node.get_id());
-            return Ok(false);
-        }
-        self.insert_and_migrate(node).await?;
-        Ok(true)
+        let inserted = self.insert_and_migrate(node).await?;
+        Ok(inserted)
     }
     async fn de_register_node(&self, node: NodeClient) -> Result<bool, Box<dyn Error>> {
         Ok(true)
+    }
+
+    async fn get_acquired_slots(&self) -> Result<Vec<u32>, Box<dyn Error>> {
+        Ok(self.metadata.read().await.acquired_slots.clone())
+    }
+
+    async fn get_total_nodes(&self) -> Result<u32, Box<dyn Error>> {
+        Ok(self.metadata.read().await.total_slots.clone())
+    }
+
+    async fn get_slot_node_map(&self) -> Result<HashMap<u32, NodeClient>, Box<dyn Error>> {
+        Ok(self.metadata.read().await.slot_node_map.clone())
     }
 }
 
@@ -151,7 +193,13 @@ impl Allocator {
 
 #[cfg(test)]
 mod tests {
-    use crate::core::allocator::{AllocationMetadata};
+    use std::sync::Arc;
+    use httpmock::Method::POST;
+    use httpmock::MockServer;
+    use serde_json::json;
+    use tokio::sync::Semaphore;
+    use crate::clients::node_client::NodeClient;
+    use crate::core::allocator::{AllocationMetadata, Allocator, RegistrationInteractions};
 
     #[test]
     pub fn test_lower_bound_when_vec_is_empty() {
@@ -182,6 +230,180 @@ mod tests {
         assert_eq!(1, metadata.identify_idx_for_slot(9));
         assert_eq!(1, metadata.identify_idx_for_slot(0));
         assert_eq!(1, metadata.identify_idx_for_slot(20));
+    }
+
+    #[tokio::test]
+    async fn test_node_insertion_when_fresh_setup() {
+        let allocator = Allocator::new(10);
+        let client = Arc::new(reqwest::Client::new());
+        let id = "random-id".to_string();
+        let node = NodeClient::new(client, "".to_string(), id);
+
+        assert_eq!(true, allocator.register_node(node).await.unwrap());
+        assert_eq!(10, allocator.get_total_nodes().await.unwrap());
+        assert_eq!(vec![6], allocator.get_acquired_slots().await.unwrap());
+        assert_eq!(1, allocator.get_slot_node_map().await.unwrap().len());
+    }
+
+    #[tokio::test]
+    async fn test_node_insertion_when_at_capacity() {
+        let allocator = Allocator::new(0);
+        let client = Arc::new(reqwest::Client::new());
+        let id = "random-id".to_string();
+        let node = NodeClient::new(client, "".to_string(), id);
+
+        assert_eq!(false, allocator.register_node(node).await.unwrap());
+        assert_eq!(0, allocator.get_total_nodes().await.unwrap());
+        assert_eq!(0, allocator.get_slot_node_map().await.unwrap().len());
+    }
+
+    #[tokio::test]
+    async fn test_sequential_node_insertion() {
+        let server = MockServer::start();
+        let allocator = Allocator::new(10);
+        let client = Arc::new(reqwest::Client::new());
+
+        let id1 = "random-id".to_string();
+        let node1 = NodeClient::new(client.clone(), server.url(""), id1);
+
+        let id2 = "random-id-new".to_string();
+        let node2 = NodeClient::new(client.clone(), server.url(""), id2);
+
+        assert_eq!(true, allocator.register_node(node1).await.unwrap());
+        assert_eq!(10, allocator.get_total_nodes().await.unwrap());
+        assert_eq!(vec![6], allocator.get_acquired_slots().await.unwrap());
+        assert_eq!(1, allocator.get_slot_node_map().await.unwrap().len());
+        let migrate_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/migrate");
+            then.status(200)
+                .header("content-type", "JSON")
+                .json_body(json!({"success": true, "message": "Migration passed"}));
+        });
+        assert_eq!(true, allocator.register_node(node2).await.unwrap());
+        assert_eq!(vec![3, 6], allocator.get_acquired_slots().await.unwrap());
+        assert_eq!(2, allocator.get_slot_node_map().await.unwrap().len());
+        migrate_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_sequential_node_insertion_with_migration() {
+        let server = MockServer::start();
+        let allocator = Allocator::new(10);
+        let client = Arc::new(reqwest::Client::new());
+
+        let id1 = "random-id".to_string();
+        let node1 = NodeClient::new(client.clone(), server.url(""), id1);
+
+        let id2 = "random-id-new".to_string();
+        let node2 = NodeClient::new(client.clone(), server.url(""), id2);
+
+        assert_eq!(true, allocator.register_node(node1).await.unwrap());
+        assert_eq!(10, allocator.get_total_nodes().await.unwrap());
+        assert_eq!(vec![6], allocator.get_acquired_slots().await.unwrap());
+        assert_eq!(1, allocator.get_slot_node_map().await.unwrap().len());
+        let migrate_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/migrate");
+            then.status(200)
+                .header("content-type", "JSON")
+                .json_body(json!({"success": true, "message": "Migration passed", "data": {
+                    "k1" : "v1",
+                    "k2" : "v2"
+                }}));
+        });
+        let insert_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/insert");
+            then.status(200)
+                .header("content-type", "JSON")
+                .json_body(json!({"success": true, "message": "Insertion Successful"}));
+        });
+        assert_eq!(true, allocator.register_node(node2).await.unwrap());
+        assert_eq!(vec![3, 6], allocator.get_acquired_slots().await.unwrap());
+        assert_eq!(2, allocator.get_slot_node_map().await.unwrap().len());
+        migrate_mock.assert();
+        insert_mock.assert_hits(2);
+    }
+
+    #[tokio::test]
+    async fn test_sequential_node_insertion_should_fail_on_conflicting_nodes() {
+        let server = MockServer::start();
+        let allocator = Allocator::new(10);
+        let client = Arc::new(reqwest::Client::new());
+
+        let id1 = "random-id".to_string();
+        let node1 = NodeClient::new(client.clone(), server.url(""), id1);
+
+        let id2 = "random-id-2".to_string();
+        let node2 = NodeClient::new(client.clone(), server.url(""), id2);
+
+        assert_eq!(true, allocator.register_node(node1).await.unwrap());
+        assert_eq!(10, allocator.get_total_nodes().await.unwrap());
+        assert_eq!(vec![6], allocator.get_acquired_slots().await.unwrap());
+        assert_eq!(1, allocator.get_slot_node_map().await.unwrap().len());
+
+
+        assert_eq!(false, allocator.register_node(node2).await.unwrap());
+        assert_eq!(vec![6], allocator.get_acquired_slots().await.unwrap());
+        assert_eq!(1, allocator.get_slot_node_map().await.unwrap().len());
+    }
+
+    #[tokio::test]
+    async fn test_simultaneous_node_insertion_with_migration() {
+        let server = MockServer::start();
+        let allocator = Arc::new(Allocator::new(550));
+        let client = Arc::new(reqwest::Client::new());
+
+        let mut nodes = Vec::with_capacity(10);
+        for i in 0..10 {
+            let id = format!("random-id-{}", i);
+            let node = NodeClient::new(client.clone(), server.url(""), id);
+            nodes.push(node);
+        }
+
+        let migrate_mock = server.mock(|when, then| {
+            when.method(POST).path("/migrate");
+            then.status(200)
+                .header("content-type", "JSON")
+                .json_body(json!({"success": true, "message": "Migration passed", "data": {
+                "k1" : "v1",
+                "k2" : "v2"
+            }}));
+        });
+
+        let insert_mock = server.mock(|when, then| {
+            when.method(POST).path("/insert");
+            then.status(200)
+                .header("content-type", "JSON")
+                .json_body(json!({"success": true, "message": "Insertion Successful"}));
+        });
+
+        const MAX_CONCURRENT_REGISTRATIONS: usize = 5;
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_REGISTRATIONS));
+
+        let mut handles = Vec::with_capacity(10);
+        for node in nodes {
+            let allocator_clone = allocator.clone();
+            let semaphore_clone = semaphore.clone();
+            let handle = tokio::spawn(async move {
+                let _permit = semaphore_clone.acquire().await.unwrap();
+                allocator_clone.register_node(node).await.unwrap()
+            });
+            handles.push(handle);
+        }
+
+        let results = futures::future::join_all(handles).await;
+        for result in results {
+            assert_eq!(true, result.unwrap());
+        }
+
+        assert_eq!(550, allocator.get_total_nodes().await.unwrap());
+        assert_eq!(10, allocator.get_acquired_slots().await.unwrap().len());
+        assert_eq!(10, allocator.get_slot_node_map().await.unwrap().len());
+
+        migrate_mock.assert_hits(9); // Assuming each node insertion triggers a migration
+        insert_mock.assert_hits(18); // Assuming each node insertion triggers two insertions
     }
 }
 

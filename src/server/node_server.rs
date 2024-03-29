@@ -34,8 +34,8 @@ impl MigrateResponse {
     pub fn is_success(&self) -> bool {
         self.success
     }
-    pub fn get_data(&self) -> HashMap<String, String> {
-        self.data.clone().unwrap()
+    pub fn get_data(&self) -> Option<HashMap<String, String>> {
+        self.data.clone()
     }
     pub fn get_msg(&self) -> String { self.message.clone() }
 }

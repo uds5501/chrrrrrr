@@ -11,13 +11,23 @@ use crate::errors::node_get_error::NodeGetError;
 pub(crate) trait NodeInteractions {
     async fn insert_key(&self, key: String, val: String) -> Result<bool, Box<dyn Error>>;
     async fn get(&self, key: String) -> Result<String, Box<dyn Error>>;
-    async fn fetch_migrated(&self, start: u32, end: u32, n: u32) -> Result<HashMap<String, String>, Box<dyn Error>>;
+    async fn fetch_migrated(&self, start: u32, end: u32, n: u32) -> Result<Option<Arc<HashMap<String, String>>>, Box<dyn Error + Send + Sync>>;
 }
 
 pub(crate) struct NodeClient {
     client: Arc<Client>,
     address: String,
     id: String,
+}
+
+impl Clone for NodeClient {
+    fn clone(&self) -> Self {
+        Self {
+            client: Arc::clone(&self.client),
+            address: self.address.clone(),
+            id: self.id.clone(),
+        }
+    }
 }
 
 impl NodeClient {
@@ -57,7 +67,7 @@ impl NodeInteractions for NodeClient {
         Err(Box::new(NodeGetError::new(data.get_msg())))
     }
 
-    async fn fetch_migrated(&self, start: u32, end: u32, n: u32) -> Result<HashMap<String, String>, Box<dyn Error>> {
+    async fn fetch_migrated(&self, start: u32, end: u32, n: u32) -> Result<Option<Arc<HashMap<String, String>>>, Box<dyn Error + Send + Sync>> {
         let request_url = format!("{}/migrate", self.address);
         let resp = self.client
             .post(request_url.clone())
@@ -65,7 +75,14 @@ impl NodeInteractions for NodeClient {
             .send().await?;
         let response_json: MigrateResponse = resp.json().await?;
         if response_json.is_success() {
-            return Ok(response_json.get_data());
+            return match response_json.get_data() {
+                Some(hmap) => {
+                    Ok(Some(Arc::new(hmap)))
+                }
+                None => {
+                    Ok(None)
+                }
+            };
         }
         Err(Box::new(MigrationError::new(response_json.get_msg())))
     }
@@ -74,14 +91,12 @@ impl NodeInteractions for NodeClient {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::hash::Hash;
     use std::sync::Arc;
     use httpmock::prelude::*;
     use reqwest::Client;
     use serde_json::json;
 
     use crate::clients::node_client::{NodeInteractions, NodeClient};
-    use crate::errors::migration_error::MigrationError;
 
     #[tokio::test]
     async fn test_insert_call_success() {
@@ -217,11 +232,11 @@ mod tests {
             address: server.url(""),
             id: "0".to_string(),
         };
-        let actual = node.fetch_migrated(0, 1, 1).await.unwrap();
+        let actual = node.fetch_migrated(0, 1, 1).await.unwrap().unwrap();
         let mut expected: HashMap<String, String> = HashMap::new();
         expected.insert("k1".to_string(), "v1".to_string());
         expected.insert("k2".to_string(), "v2".to_string());
-        assert_eq!(expected, actual);
+        assert_eq!(Arc::new(expected), actual);
         migrate_mock.assert();
     }
 }
