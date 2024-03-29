@@ -3,17 +3,35 @@ use std::sync::{RwLock};
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::{AcqRel, Acquire};
 use crate::core::hash::hash;
+use rand::Rng;
+
 
 pub(crate) struct Node {
     store: RwLock<HashMap<String, String>>,
     key_count: AtomicU32,
+    id: String,
 }
 
 impl Node {
     pub fn new() -> Self {
+        let mut rng = rand::thread_rng();
+        let node_id: String = (0..10)
+            .map(|_| {
+                let random_char = rng.gen_range(0..36);
+                if random_char < 26 {
+                    // Generate an uppercase letter
+                    (random_char + 65 as u8) as char
+                } else {
+                    // Generate a digit
+                    (random_char - 26 + 48 as u8) as char
+                }
+            })
+            .map(|c| c.to_string())
+            .collect();
         Self {
             store: RwLock::new(Default::default()),
             key_count: AtomicU32::new(0),
+            id: node_id
         }
     }
 
@@ -54,6 +72,10 @@ impl Node {
         }
         self.key_count.fetch_sub(cnt_remove, AcqRel);
         removed_hm
+    }
+
+    pub fn get_id(&self) -> String {
+        self.id.clone()
     }
 }
 

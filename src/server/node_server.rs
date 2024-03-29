@@ -1,10 +1,18 @@
 use std::collections::HashMap;
 use std::env;
+
+use std::string::ToString;
 use std::sync::Arc;
 use warp::{Filter, Rejection, Reply};
 use serde::{Deserialize, Serialize};
 use log::{debug, info};
+use reqwest::Client;
+use crate::clients::allocator_client::{AllocatorClient, AllocatorInteractions};
 use crate::core::node::Node;
+
+
+const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:3030";
+const DEFAULT_PORT: u16 = 3031;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub(crate) struct InsertResponse {
@@ -150,11 +158,18 @@ fn migrate_body() -> impl Filter<Extract=(MigrateRequest, ), Error=Rejection> + 
 pub async fn main() {
     let args: Vec<String> = env::args().collect();
     let port: u16 = match args.windows(2).find(|w| w[0] == "--p") {
-        Some(window) => window[1].parse().unwrap_or(3031),
-        None => 3031,
+        Some(window) => window[1].parse().unwrap_or(DEFAULT_PORT),
+        None => DEFAULT_PORT,
     };
+    let server_url: String = match args.windows(2).find(|w| w[0] == "--s") {
+        Some(window) => window[1].parse().unwrap_or(DEFAULT_SERVER_URL.to_string()),
+        None => DEFAULT_SERVER_URL.to_string(),
+    };
+    let alloc_client = Arc::new(Client::new());
+    let allocator_client = AllocatorClient::new(alloc_client, server_url.clone());
 
     let node = Arc::new(Node::new());
+    let node_for_registration = Arc::clone(&node);
     let node_filter = warp::any().map(move || Arc::clone(&node));
 
     // POST /insert
@@ -180,6 +195,15 @@ pub async fn main() {
         .or(route_get)
         .or(route_migrate);
 
-    info!("Starting server at :{port}");
+    info!("Starting server at :{:?}", &port);
+    info!("Registering to allocator ({:?})", &server_url);
+    match allocator_client.register(node_for_registration.get_id()).await {
+        Ok(registered) => {
+            info!("Registration status - {registered}");
+        }
+        Err(e) => {
+            debug!("Some unexpected error occurred - {:?}", e);
+        }
+    }
     warp::serve(routes).run(([127, 0, 0, 1], port)).await;
 }

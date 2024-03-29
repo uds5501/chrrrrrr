@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::error::Error;
-use std::sync::Arc;
+
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::{AcqRel, Acquire};
 use async_trait::async_trait;
@@ -164,7 +164,7 @@ impl RegistrationInteractions for Allocator {
         let inserted = self.insert_and_migrate(node).await?;
         Ok(inserted)
     }
-    async fn de_register_node(&self, node: NodeClient) -> Result<bool, Box<dyn Error>> {
+    async fn de_register_node(&self, _node: NodeClient) -> Result<bool, Box<dyn Error>> {
         Ok(true)
     }
 
