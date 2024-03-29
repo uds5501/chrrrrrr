@@ -1,39 +1,44 @@
+use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 use async_trait::async_trait;
 use reqwest::Client;
-use crate::server::node_server::{GetResponse, InsertRequest, InsertResponse};
+use crate::errors::migration_error::MigrationError;
+use crate::server::node_server::{GetResponse, InsertRequest, InsertResponse, MigrateRequest, MigrateResponse};
 use crate::errors::node_get_error::NodeGetError;
 
 #[async_trait]
 pub(crate) trait NodeInteractions {
     async fn insert_key(&self, key: String, val: String) -> Result<bool, Box<dyn Error>>;
     async fn get(&self, key: String) -> Result<String, Box<dyn Error>>;
+    async fn fetch_migrated(&self, start: u32, end: u32, n: u32) -> Result<HashMap<String, String>, Box<dyn Error>>;
 }
 
-pub(crate) struct NodeMetadata {
+pub(crate) struct NodeClient {
     client: Arc<Client>,
     address: String,
-    id: u32,
+    id: String,
 }
 
-impl NodeMetadata {
-    pub fn new(client: Arc<Client>, address: String, id: u32) -> Self {
+impl NodeClient {
+    pub fn new(client: Arc<Client>, address: String, id: String) -> Self {
         Self {
             client,
             address,
             id,
         }
     }
+    pub fn get_id(&self) -> &String {
+        return &self.id;
+    }
 }
 
 #[async_trait]
-impl NodeInteractions for NodeMetadata {
+impl NodeInteractions for NodeClient {
     async fn insert_key(&self, key: String, val: String) -> Result<bool, Box<dyn Error>> {
         let request_url = format!("{}/insert", self.address);
-        println!("{}", request_url);
         let resp = self.client
-            .post(request_url.clone())
+            .post(request_url)
             .json(&InsertRequest::new(key, val))
             .send().await?;
         let data: InsertResponse = resp.json().await?;
@@ -42,9 +47,8 @@ impl NodeInteractions for NodeMetadata {
 
     async fn get(&self, key: String) -> Result<String, Box<dyn Error>> {
         let request_url = format!("{}/get/{}", self.address, key);
-        println!("{}", request_url);
         let resp = self.client
-            .get(request_url.clone())
+            .get(request_url)
             .send().await?;
         let data: GetResponse = resp.json().await?;
         if data.is_success() {
@@ -52,17 +56,32 @@ impl NodeInteractions for NodeMetadata {
         }
         Err(Box::new(NodeGetError::new(data.get_msg())))
     }
+
+    async fn fetch_migrated(&self, start: u32, end: u32, n: u32) -> Result<HashMap<String, String>, Box<dyn Error>> {
+        let request_url = format!("{}/migrate", self.address);
+        let resp = self.client
+            .post(request_url.clone())
+            .json(&MigrateRequest::new(start, end, n))
+            .send().await?;
+        let response_json: MigrateResponse = resp.json().await?;
+        if response_json.is_success() {
+            return Ok(response_json.get_data());
+        }
+        Err(Box::new(MigrationError::new(response_json.get_msg())))
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::hash::Hash;
     use std::sync::Arc;
     use httpmock::prelude::*;
     use reqwest::Client;
     use serde_json::json;
 
-    use crate::clients::node_client::{NodeInteractions, NodeMetadata};
-    use crate::server::node_server::InsertResponse;
+    use crate::clients::node_client::{NodeInteractions, NodeClient};
+    use crate::errors::migration_error::MigrationError;
 
     #[tokio::test]
     async fn test_insert_call_success() {
@@ -77,10 +96,10 @@ mod tests {
         });
 
         let client = Arc::new(Client::new());
-        let node = NodeMetadata {
+        let node = NodeClient {
             client,
             address: server.url(""),
-            id: 0,
+            id: "0".to_string(),
         };
         assert_eq!(true, node.insert_key("foo".to_string(), "bar".to_string()).await.unwrap());
         insert_mock.assert();
@@ -99,10 +118,10 @@ mod tests {
         });
 
         let client = Arc::new(Client::new());
-        let node = NodeMetadata {
+        let node = NodeClient {
             client,
             address: server.url(""),
-            id: 0,
+            id: "0".to_string(),
         };
         assert_eq!(false, node.insert_key("foo".to_string(), "bar".to_string()).await.unwrap());
         insert_mock.assert();
@@ -121,10 +140,10 @@ mod tests {
         });
 
         let client = Arc::new(Client::new());
-        let node = NodeMetadata {
+        let node = NodeClient {
             client,
             address: server.url(""),
-            id: 0,
+            id: "0".to_string(),
         };
         assert_eq!("bar", node.get("foo".to_string()).await.unwrap());
         insert_mock.assert();
@@ -134,21 +153,75 @@ mod tests {
     async fn test_get_call_fails() {
         let server = MockServer::start();
 
-        let insert_mock = server.mock(|when, then| {
+        let get_mock = server.mock(|when, then| {
             when.method(GET)
                 .path("/get/foo");
             then.status(200)
                 .header("content-type", "JSON")
-                .json_body(json!({"success": false, "message": "Key not present", "value": "bar"}));
+                .json_body(json!({"success": false, "message": "Key not present"}));
         });
 
         let client = Arc::new(Client::new());
-        let node = NodeMetadata {
+        let node = NodeClient {
             client,
             address: server.url(""),
-            id: 0,
+            id: "0".to_string(),
         };
-        assert_eq!("bar", node.get("foo".to_string()).await.unwrap());
-        insert_mock.assert();
+        let actual = node.get("foo".to_string()).await.unwrap_err();
+        assert_eq!("Node fetch failed with error: Key not present".to_string(), actual.to_string());
+        get_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_migrate_call_fails() {
+        let server = MockServer::start();
+
+        let migrate_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/migrate");
+            then.status(200)
+                .header("content-type", "JSON")
+                .json_body(json!({"success": false, "message": "Migration failed"}));
+        });
+
+        let client = Arc::new(Client::new());
+        let node = NodeClient {
+            client,
+            address: server.url(""),
+            id: "0".to_string(),
+        };
+        let actual = node.fetch_migrated(0, 1, 1).await.unwrap_err();
+        assert_eq!("Key migration failed with error: Migration failed".to_string(), actual.to_string());
+        migrate_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_migrate_call_success() {
+        let server = MockServer::start();
+
+        let migrate_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/migrate");
+            then.status(200)
+                .header("content-type", "JSON")
+                .json_body(json!({"success": true, "message": "Migration passed",
+                    "data": {
+                    "k1": "v1",
+                    "k2": "v2"
+                }}));
+        });
+
+        let client = Arc::new(Client::new());
+        let node = NodeClient {
+            client,
+            address: server.url(""),
+            id: "0".to_string(),
+        };
+        let actual = node.fetch_migrated(0, 1, 1).await.unwrap();
+        let mut expected: HashMap<String, String> = HashMap::new();
+        expected.insert("k1".to_string(), "v1".to_string());
+        expected.insert("k2".to_string(), "v2".to_string());
+        assert_eq!(expected, actual);
+        migrate_mock.assert();
     }
 }

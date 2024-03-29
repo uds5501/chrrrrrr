@@ -1,17 +1,17 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::atomic::AtomicU32;
-use std::sync::atomic::Ordering::Acquire;
+use std::sync::atomic::Ordering::{AcqRel, Acquire};
 use async_trait::async_trait;
 use crate::core::hash::hash;
-use crate::clients::node_client::{NodeInteractions, NodeMetadata};
+use crate::clients::node_client::{NodeInteractions, NodeClient};
 use tokio::sync::RwLock;
 
 
 struct AllocationMetadata {
     total_slots: u32,
     acquired_slots: Vec<u32>,
-    slot_node_map: HashMap<u32, NodeMetadata>,
+    slot_node_map: HashMap<u32, NodeClient>,
 }
 
 pub struct Allocator {
@@ -25,11 +25,11 @@ impl AllocationMetadata {
         Self { total_slots: slots, acquired_slots: vec![], slot_node_map: Default::default() }
     }
 
-    pub fn node_for_hash(&self, hash: u32) -> Option<&NodeMetadata> {
+    pub fn node_for_hash(&self, hash: u32) -> Option<&NodeClient> {
         self.node_from_idx(self.identify_idx_for_slot(hash))
     }
 
-    pub fn node_from_idx(&self, slot: u32) -> Option<&NodeMetadata> {
+    pub fn node_from_idx(&self, slot: u32) -> Option<&NodeClient> {
         self.slot_node_map.get(&slot)
     }
 
@@ -55,9 +55,15 @@ impl AllocationMetadata {
 }
 
 #[async_trait]
-trait StorageInteractions {
+pub trait StorageInteractions {
     async fn store(&self, key: &String, val: &String) -> Result<bool, Box<dyn Error>>;
     async fn get(&self, key: &String) -> Result<String, Box<dyn Error>>;
+}
+
+#[async_trait]
+pub trait RegistrationInteractions {
+    async fn register_node(&self, node: NodeClient) -> Result<bool, Box<dyn Error>>;
+    async fn de_register_node(&self, node: NodeClient) -> Result<bool, Box<dyn Error>>;
 }
 
 #[async_trait]
@@ -69,8 +75,8 @@ impl StorageInteractions for Allocator {
         }
         if let Some(node) = self.metadata.read().await.node_for_hash(hash(key, &self.slots)) {
             match node.insert_key(key.clone(), val.clone()).await {
-                Ok(ins) => {inserted = ins}
-                Err(e) => {return Err(e)}
+                Ok(ins) => { inserted = ins }
+                Err(e) => { return Err(e); }
             }
             inserted = node.insert_key(key.clone(), val.clone()).await.unwrap();
         }
@@ -89,6 +95,49 @@ impl StorageInteractions for Allocator {
     }
 }
 
+#[async_trait]
+pub trait RegistrationInternals {
+    async fn insert_and_migrate(&self, node: NodeClient) -> Result<bool, Box<dyn Error>>;
+}
+
+#[async_trait]
+impl RegistrationInternals for Allocator {
+    async fn insert_and_migrate(&self, node: NodeClient) -> Result<bool, Box<dyn Error>> {
+        let mut metadata = self.metadata.write().await;
+        let slot = hash(&node.get_id(), &metadata.total_slots);
+        let idx = metadata.identify_idx_for_slot(slot);
+
+        // if it's not the first element.
+        if metadata.acquired_slots.len() != 0 {
+            let len = metadata.acquired_slots.len();
+            let last_node_idx = metadata.acquired_slots[idx as usize % len];
+        }
+        self.nodes.fetch_add(1, AcqRel);
+        metadata.acquired_slots.push(slot);
+        metadata.slot_node_map.insert(slot, node);
+        Ok(true)
+    }
+}
+
+#[async_trait]
+impl RegistrationInteractions for Allocator {
+    async fn register_node(&self, node: NodeClient) -> Result<bool, Box<dyn Error>> {
+        let metadata = self.metadata.read().await;
+        if metadata.total_slots == metadata.acquired_slots.len() as u32 {
+            return Ok(false);
+        }
+        let slot = hash(&node.get_id(), &metadata.total_slots);
+        if metadata.slot_node_map.contains_key(&slot) {
+            println!("New node {:?} can't be added as slot {slot} is already taken", node.get_id());
+            return Ok(false);
+        }
+        self.insert_and_migrate(node).await?;
+        Ok(true)
+    }
+    async fn de_register_node(&self, node: NodeClient) -> Result<bool, Box<dyn Error>> {
+        Ok(true)
+    }
+}
 
 impl Allocator {
     pub fn new(slots: u32) -> Self {
@@ -102,11 +151,17 @@ impl Allocator {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::Ordering::Release;
-    use crate::core::allocator::{AllocationMetadata, Allocator, StorageInteractions};
-    use reqwest::Client;
-    use crate::clients::node_client::{MockNodeMetadata, NodeMetadata};
+    use crate::core::allocator::{AllocationMetadata};
+
+    #[test]
+    pub fn test_lower_bound_when_vec_is_empty() {
+        let mut metadata = AllocationMetadata::new(30);
+        metadata.acquired_slots = vec![];
+        assert_eq!(0, metadata.identify_idx_for_slot(1));
+        assert_eq!(0, metadata.identify_idx_for_slot(8));
+        assert_eq!(0, metadata.identify_idx_for_slot(21));
+        assert_eq!(0, metadata.identify_idx_for_slot(29));
+    }
 
     #[test]
     pub fn test_lower_bound_impl() {
