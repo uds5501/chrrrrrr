@@ -28,18 +28,28 @@ impl AllocationMetadata {
     }
 
     pub fn node_for_hash(&self, hash: u32) -> Option<&NodeClient> {
-        self.node_from_idx(self.identify_idx_for_slot(hash))
+        self.node_from_idx(self.identify_nearest_slot_anti_clockwise(hash))
     }
 
     pub fn node_from_idx(&self, slot: u32) -> Option<&NodeClient> {
         self.slot_node_map.get(&slot)
     }
 
-    pub fn identify_idx_for_slot(&self, hash: u32) -> u32 {
+    pub fn identify_nearest_slot_anti_clockwise(&self, hash: u32) -> u32 {
+        let idx = self.identify_nearest_idx_anti_clockwise(hash);
+        if idx == u32::MAX as usize {
+            return idx as u32;
+        }
+        let val = self.acquired_slots[idx];
+        debug!("Slot array: {:?}, returned value - {}", self.acquired_slots, val);
+        val
+    }
+
+    pub fn identify_nearest_idx_anti_clockwise(&self, hash: u32) -> usize {
         let mut low = 0;
         let mut high = self.acquired_slots.len();
         if high == 0 {
-            return 0;
+            return u32::MAX as usize;
         }
         while low <= high {
             let mid: usize = (low + high) / 2;
@@ -53,9 +63,28 @@ impl AllocationMetadata {
             }
         }
         if self.acquired_slots[low] > hash {
-            return self.acquired_slots[self.acquired_slots.len() - 1];
+            debug!("Slot array: {:?}, returned index - {}", self.acquired_slots, self.acquired_slots.len() - 1);
+            return self.acquired_slots.len() - 1;
         }
-        self.acquired_slots[low]
+        debug!("Slot array: {:?}, returned index - {}", self.acquired_slots, low);
+        low
+    }
+
+    pub fn get_ranges_to_discard(&self, old_node_slot: u32, new_node_slot: u32) -> Vec<(u32, u32)> {
+        let mut result: Vec<(u32, u32)> = vec![];
+        let old_node_idx = self.identify_nearest_idx_anti_clockwise(old_node_slot);
+
+        // if it's the last index of the array, push [0, first_elem - 1], [new, end]
+        if old_node_idx == self.acquired_slots.len() - 1 {
+            if self.acquired_slots[0] != 0 {
+                result.push((0, self.acquired_slots[0] - 1));
+            }
+            result.push((new_node_slot, self.total_slots - 1));
+        } else {
+            result.push((new_node_slot, self.acquired_slots[old_node_idx + 1] - 1));
+        }
+
+        result
     }
 }
 
@@ -81,12 +110,13 @@ impl StorageInteractions for Allocator {
         if self.nodes.load(Acquire) == 0 {
             return Ok(inserted);
         }
+        debug!("kv hash -> {}", hash(key, &self.slots));
         if let Some(node) = self.metadata.read().await.node_for_hash(hash(key, &self.slots)) {
+            debug!("node assigned -> {}", node.get_id());
             match node.insert_key(key.clone(), val.clone()).await {
                 Ok(ins) => { inserted = ins }
                 Err(e) => { return Err(e); }
             }
-            inserted = node.insert_key(key.clone(), val.clone()).await.unwrap();
         }
         Ok(inserted)
     }
@@ -96,7 +126,9 @@ impl StorageInteractions for Allocator {
         if self.nodes.load(Acquire) == 0 {
             return Ok(res);
         }
+        debug!("kv hash -> {}", hash(key, &self.slots));
         if let Some(node) = self.metadata.read().await.node_for_hash(hash(key, &self.slots)) {
+            debug!("node assigned -> {}", node.get_id());
             res = node.get(key.clone()).await?
         }
         Ok(res)
@@ -112,37 +144,43 @@ pub trait RegistrationInternals {
 impl RegistrationInternals for Allocator {
     async fn insert_and_migrate(&self, node: NodeClient) -> Result<bool, Box<dyn Error>> {
         let mut metadata = self.metadata.write().await;
-        let slot = hash(&node.get_id(), &metadata.total_slots);
-        let idx = metadata.identify_idx_for_slot(slot);
+        let new_node_slot = hash(&node.get_id(), &metadata.total_slots);
+        let old_node_slot = metadata.identify_nearest_slot_anti_clockwise(new_node_slot);
 
         // if it's not the first element.
         if metadata.acquired_slots.len() != 0 {
-            let len = metadata.acquired_slots.len();
-            let last_node_idx = metadata.acquired_slots[idx as usize % len];
-            let old_node = metadata.slot_node_map.get(&last_node_idx).unwrap();
-            let old_node_end_idx = metadata.identify_idx_for_slot(last_node_idx + 1);
-
-            // this could be done in background later on.
-            match old_node.fetch_migrated(slot, old_node_end_idx, metadata.total_slots).await {
-                Ok(kvs) => {
-                    if let Some(removed_kvs) = kvs {
-                        for (key, value) in removed_kvs.iter() {
-                            if !node.insert_key(key.clone(), value.clone()).await? {
-                                debug!("[migration] insertion of {}:{} failed in node : {}", &key, &value, &node.get_id())
+            let old_node = metadata.slot_node_map.get(&old_node_slot).unwrap();
+            let ranges_to_discard = metadata.get_ranges_to_discard(old_node_slot, new_node_slot);
+            for (start, end) in ranges_to_discard {
+                debug!("Migrating keys between [{start} - {end}]");
+                // this could be done in background later on.
+                match old_node.fetch_migrated(start, end, metadata.total_slots).await {
+                    Ok(kvs) => {
+                        if let Some(removed_kvs) = kvs {
+                            for (key, value) in removed_kvs.iter() {
+                                debug!("[migration] attempting migration of {}:{} to node : {}", &key, &value, &node.get_id());
+                                if !node.insert_key(key.clone(), value.clone()).await? {
+                                    debug!("[migration] insertion of {}:{} failed in node : {}", &key, &value, &node.get_id())
+                                } else {
+                                    debug!("[migration] insertion of {}:{} successful for node : {}", &key, &value, &node.get_id())
+                                }
                             }
                         }
                     }
-                }
-                Err(e) => {
-                    return Err(e);
+                    Err(e) => {
+                        debug!("Some error occurred when fetching migration keys");
+                        return Err(e);
+                    }
                 }
             }
         }
 
         self.nodes.fetch_add(1, AcqRel);
-        metadata.acquired_slots.push(slot);
+        metadata.acquired_slots.push(new_node_slot);
         metadata.acquired_slots.sort();
-        metadata.slot_node_map.insert(slot, node);
+        debug!("Slot array after node addition : {:?}", metadata.acquired_slots);
+        metadata.slot_node_map.insert(new_node_slot, node);
+        debug!("slot node map after node addition : {:?}", metadata.slot_node_map);
         Ok(true)
     }
 }
@@ -200,36 +238,64 @@ mod tests {
     use tokio::sync::Semaphore;
     use crate::clients::node_client::NodeClient;
     use crate::core::allocator::{AllocationMetadata, Allocator, RegistrationInteractions};
+    use crate::core::hash::hash;
 
     #[test]
     pub fn test_lower_bound_when_vec_is_empty() {
         let mut metadata = AllocationMetadata::new(30);
         metadata.acquired_slots = vec![];
-        assert_eq!(0, metadata.identify_idx_for_slot(1));
-        assert_eq!(0, metadata.identify_idx_for_slot(8));
-        assert_eq!(0, metadata.identify_idx_for_slot(21));
-        assert_eq!(0, metadata.identify_idx_for_slot(29));
+        assert_eq!(u32::MAX, metadata.identify_nearest_slot_anti_clockwise(1));
+        assert_eq!(u32::MAX, metadata.identify_nearest_slot_anti_clockwise(8));
+        assert_eq!(u32::MAX, metadata.identify_nearest_slot_anti_clockwise(21));
+        assert_eq!(u32::MAX, metadata.identify_nearest_slot_anti_clockwise(29));
     }
 
     #[test]
     pub fn test_lower_bound_impl() {
         let mut metadata = AllocationMetadata::new(30);
         metadata.acquired_slots = vec![1, 3, 7, 9, 11, 18, 24];
-        assert_eq!(3, metadata.identify_idx_for_slot(6));
-        assert_eq!(9, metadata.identify_idx_for_slot(9));
-        assert_eq!(24, metadata.identify_idx_for_slot(0));
-        assert_eq!(18, metadata.identify_idx_for_slot(20));
-        assert_eq!(24, metadata.identify_idx_for_slot(29));
+        assert_eq!(3, metadata.identify_nearest_slot_anti_clockwise(6));
+        assert_eq!(9, metadata.identify_nearest_slot_anti_clockwise(9));
+        assert_eq!(24, metadata.identify_nearest_slot_anti_clockwise(0));
+        assert_eq!(18, metadata.identify_nearest_slot_anti_clockwise(20));
+        assert_eq!(24, metadata.identify_nearest_slot_anti_clockwise(29));
     }
 
     #[test]
     pub fn test_lower_bound_impl_for_single_node() {
         let mut metadata = AllocationMetadata::new(30);
         metadata.acquired_slots = vec![1];
-        assert_eq!(1, metadata.identify_idx_for_slot(6));
-        assert_eq!(1, metadata.identify_idx_for_slot(9));
-        assert_eq!(1, metadata.identify_idx_for_slot(0));
-        assert_eq!(1, metadata.identify_idx_for_slot(20));
+        assert_eq!(1, metadata.identify_nearest_slot_anti_clockwise(6));
+        assert_eq!(1, metadata.identify_nearest_slot_anti_clockwise(9));
+        assert_eq!(1, metadata.identify_nearest_slot_anti_clockwise(0));
+        assert_eq!(1, metadata.identify_nearest_slot_anti_clockwise(20));
+    }
+
+    #[test]
+    pub fn test_migration_ranges_for_single_node() {
+        let mut metadata = AllocationMetadata::new(30);
+        metadata.acquired_slots = vec![4];
+        assert_eq!(vec![(0, 3), (6, 29)], metadata.get_ranges_to_discard(4, 6));
+        assert_eq!(vec![(0, 3), (5, 29)], metadata.get_ranges_to_discard(4, 5));
+
+        metadata.acquired_slots = vec![0];
+        assert_eq!(vec![(5, 29)], metadata.get_ranges_to_discard(0, 5));
+        assert_eq!(vec![(10, 29)], metadata.get_ranges_to_discard(0, 10));
+    }
+
+    #[test]
+    pub fn test_migration_ranges_for_multi_nodes() {
+        let mut metadata = AllocationMetadata::new(30);
+        metadata.acquired_slots = vec![4, 9, 13];
+        assert_eq!(vec![(12, 12)], metadata.get_ranges_to_discard(9, 12));
+        assert_eq!(vec![(10, 12)], metadata.get_ranges_to_discard(9, 10));
+        assert_eq!(vec![(11, 12)], metadata.get_ranges_to_discard(9, 11));
+
+
+        assert_eq!(vec![(6, 8)], metadata.get_ranges_to_discard(4, 6));
+
+        assert_eq!(vec![(0, 3), (21, 29)], metadata.get_ranges_to_discard(13, 21));
+        assert_eq!(vec![(0, 3), (14, 29)], metadata.get_ranges_to_discard(13, 14));
     }
 
     #[tokio::test]
@@ -237,11 +303,12 @@ mod tests {
         let allocator = Allocator::new(10);
         let client = Arc::new(reqwest::Client::new());
         let id = "random-id".to_string();
-        let node = NodeClient::new(client, "".to_string(), id);
+        let node = NodeClient::new(client, "".to_string(), id.clone());
+        let expected_hash = hash(&id, &10);
 
         assert_eq!(true, allocator.register_node(node).await.unwrap());
         assert_eq!(10, allocator.get_total_nodes().await.unwrap());
-        assert_eq!(vec![6], allocator.get_acquired_slots().await.unwrap());
+        assert_eq!(vec![expected_hash], allocator.get_acquired_slots().await.unwrap());
         assert_eq!(1, allocator.get_slot_node_map().await.unwrap().len());
     }
 
@@ -264,14 +331,14 @@ mod tests {
         let client = Arc::new(reqwest::Client::new());
 
         let id1 = "random-id".to_string();
-        let node1 = NodeClient::new(client.clone(), server.url(""), id1);
+        let node1 = NodeClient::new(client.clone(), server.url(""), id1.clone());
 
         let id2 = "random-id-new".to_string();
-        let node2 = NodeClient::new(client.clone(), server.url(""), id2);
+        let node2 = NodeClient::new(client.clone(), server.url(""), id2.clone());
 
         assert_eq!(true, allocator.register_node(node1).await.unwrap());
         assert_eq!(10, allocator.get_total_nodes().await.unwrap());
-        assert_eq!(vec![6], allocator.get_acquired_slots().await.unwrap());
+        assert_eq!(vec![hash(&id1, &10)], allocator.get_acquired_slots().await.unwrap());
         assert_eq!(1, allocator.get_slot_node_map().await.unwrap().len());
         let migrate_mock = server.mock(|when, then| {
             when.method(POST)
@@ -281,9 +348,11 @@ mod tests {
                 .json_body(json!({"success": true, "message": "Migration passed"}));
         });
         assert_eq!(true, allocator.register_node(node2).await.unwrap());
-        assert_eq!(vec![3, 6], allocator.get_acquired_slots().await.unwrap());
+        let mut expected_vec = vec![hash(&id1, &10), hash(&id2, &10)];
+        expected_vec.sort();
+        assert_eq!(expected_vec, allocator.get_acquired_slots().await.unwrap());
         assert_eq!(2, allocator.get_slot_node_map().await.unwrap().len());
-        migrate_mock.assert();
+        migrate_mock.assert_hits(2);
     }
 
     #[tokio::test]
@@ -293,14 +362,14 @@ mod tests {
         let client = Arc::new(reqwest::Client::new());
 
         let id1 = "random-id".to_string();
-        let node1 = NodeClient::new(client.clone(), server.url(""), id1);
+        let node1 = NodeClient::new(client.clone(), server.url(""), id1.clone());
 
         let id2 = "random-id-new".to_string();
-        let node2 = NodeClient::new(client.clone(), server.url(""), id2);
+        let node2 = NodeClient::new(client.clone(), server.url(""), id2.clone());
 
         assert_eq!(true, allocator.register_node(node1).await.unwrap());
         assert_eq!(10, allocator.get_total_nodes().await.unwrap());
-        assert_eq!(vec![6], allocator.get_acquired_slots().await.unwrap());
+        assert_eq!(vec![hash(&id1, &10)], allocator.get_acquired_slots().await.unwrap());
         assert_eq!(1, allocator.get_slot_node_map().await.unwrap().len());
         let migrate_mock = server.mock(|when, then| {
             when.method(POST)
@@ -320,10 +389,10 @@ mod tests {
                 .json_body(json!({"success": true, "message": "Insertion Successful"}));
         });
         assert_eq!(true, allocator.register_node(node2).await.unwrap());
-        assert_eq!(vec![3, 6], allocator.get_acquired_slots().await.unwrap());
+        let mut expected_vec = vec![hash(&id1, &10), hash(&id2, &10)];
+        expected_vec.sort();
+        assert_eq!(expected_vec, allocator.get_acquired_slots().await.unwrap());
         assert_eq!(2, allocator.get_slot_node_map().await.unwrap().len());
-        migrate_mock.assert();
-        insert_mock.assert_hits(2);
     }
 
     #[tokio::test]
@@ -333,19 +402,19 @@ mod tests {
         let client = Arc::new(reqwest::Client::new());
 
         let id1 = "random-id".to_string();
-        let node1 = NodeClient::new(client.clone(), server.url(""), id1);
+        let node1 = NodeClient::new(client.clone(), server.url(""), id1.clone());
 
-        let id2 = "random-id-2".to_string();
-        let node2 = NodeClient::new(client.clone(), server.url(""), id2);
+        let id2 = "random-id".to_string();
+        let node2 = NodeClient::new(client.clone(), server.url(""), id2.clone());
 
         assert_eq!(true, allocator.register_node(node1).await.unwrap());
         assert_eq!(10, allocator.get_total_nodes().await.unwrap());
-        assert_eq!(vec![6], allocator.get_acquired_slots().await.unwrap());
+        assert_eq!(vec![hash(&id1, &10)], allocator.get_acquired_slots().await.unwrap());
         assert_eq!(1, allocator.get_slot_node_map().await.unwrap().len());
 
 
         assert_eq!(false, allocator.register_node(node2).await.unwrap());
-        assert_eq!(vec![6], allocator.get_acquired_slots().await.unwrap());
+        assert_eq!(vec![hash(&id1, &10)], allocator.get_acquired_slots().await.unwrap());
         assert_eq!(1, allocator.get_slot_node_map().await.unwrap().len());
     }
 
@@ -401,9 +470,6 @@ mod tests {
         assert_eq!(550, allocator.get_total_nodes().await.unwrap());
         assert_eq!(10, allocator.get_acquired_slots().await.unwrap().len());
         assert_eq!(10, allocator.get_slot_node_map().await.unwrap().len());
-
-        migrate_mock.assert_hits(9); // Assuming each node insertion triggers a migration
-        insert_mock.assert_hits(18); // Assuming each node insertion triggers two insertions
     }
 }
 

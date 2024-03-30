@@ -35,6 +35,7 @@ pub(crate) struct AllocatorGetResponse {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct RegisterNodeRequest {
     id: String,
+    port: u16,
 }
 
 
@@ -114,7 +115,7 @@ async fn handle_register(req: RegisterNodeRequest, allocator: Arc<Allocator>, re
                     return Ok(warp::reply::json(&resp));
                 }
             }
-            let port = address.port();
+            let port = req.port;
             let combined_address = format!("http://{host}:{port}");
             match allocator.register_node(NodeClient::new(client, combined_address, req.id)).await {
                 Ok(_) => {

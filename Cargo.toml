@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 thiserror = "1.0.58"
-tokio = { version = "1.36.0", features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1.35.1", features = ["rt", "rt-multi-thread", "macros", "signal"] }
 warp = "0.3.6"
 serde = { version = "1.0.197", features = ["derive"] }
 log = "0.4.21"
@@ -18,7 +18,7 @@ dns-lookup = "2.0.4"
 futures = "0.3.30"
 rand = "0.8.5"
 env_logger = "0.11.3"
-
+ahash = "0.8.11"
 
 [dev-dependencies]
 httpmock = "0.7.0-rc.1"

@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::env;
-
 use std::string::ToString;
 use std::sync::Arc;
+use std::time::Duration;
 use warp::{Filter, Rejection, Reply};
 use serde::{Deserialize, Serialize};
 use log::{debug, info};
 use reqwest::Client;
+use tokio::signal;
+use tokio::time::sleep;
 use crate::clients::allocator_client::{AllocatorClient, AllocatorInteractions};
 use crate::core::node::Node;
 
@@ -169,33 +171,11 @@ pub async fn main() {
     let allocator_client = AllocatorClient::new(alloc_client, server_url.clone());
 
     let mut node = Node::new();
-
-    let mut retries = 10;
-    let mut is_registered = false;
-    while !is_registered {
-        match allocator_client.register(node.get_id(), port.clone()).await {
-            Ok(registered) => {
-                info!("Registration status - {registered}");
-                is_registered = registered;
-                if !registered {
-                    retries -= 1;
-                }
-            }
-            Err(e) => {
-                debug!("Some unexpected error occurred - {:?}", e);
-                if retries > 0 {
-                    retries -= 1;
-                    node.renew_id();
-                } else {
-                    panic!("Registration retries exhausted, registration failed!");
-                }
-            }
-        }
-    }
     let node_ref = Arc::new(node);
+    let node_ref_2 = Arc::clone(&node_ref);
     let node_filter = warp::any().map(move || Arc::clone(&node_ref));
 
-    // POST /insert
+    // Define routes
     let route_insert = warp::path("insert")
         .and(warp::path::end())
         .and(json_body())
@@ -218,7 +198,49 @@ pub async fn main() {
         .or(route_get)
         .or(route_migrate);
 
-    info!("Starting server at :{:?}", &port);
-    info!("Registering to allocator ({:?})", &server_url);
-    warp::serve(routes).run(([127, 0, 0, 1], port)).await;
+    // Spawn a new task to start the server
+    let server_task = tokio::spawn(async move {
+        info!("Starting server at :{:?}", &port);
+        warp::serve(routes).run(([127, 0, 0, 1], port)).await;
+    });
+
+    // Perform registration logic after the server has started
+    tokio::join!(
+        async {
+            sleep(Duration::new(1, 0)).await;
+            info!("Registering to allocator ({:?})", &server_url);
+            let mut retries = 10;
+            let mut is_registered = false;
+            while !is_registered {
+                match allocator_client.register(node_ref_2.get_id(), port.clone()).await {
+                    Ok(registered) => {
+                        info!("Registration status - {registered}");
+                        is_registered = registered;
+                        if !registered {
+                            retries -= 1;
+                            node_ref_2.renew_id();
+                        }
+                    }
+                    Err(e) => {
+                        debug!("Some unexpected error occurred - {:?}", e);
+                        if retries > 0 {
+                            retries -= 1;
+                            node_ref_2.renew_id();
+                        } else {
+                            panic!("Registration retries exhausted, registration failed!");
+                        }
+                    }
+                }
+            }
+        }
+    );
+
+
+    match signal::ctrl_c().await {
+        Ok(()) => {}
+        Err(err) => {
+            eprintln!("Unable to listen for shutdown signal: {}", err);
+            // we also shut down in case of error
+        }
+    }
 }

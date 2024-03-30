@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 #[async_trait]
 pub(crate) trait AllocatorInteractions {
-    async fn register(&self, id: String) -> Result<bool, Box<dyn Error>>;
+    async fn register(&self, id: String, port: u16) -> Result<bool, Box<dyn Error>>;
 }
 
 pub(crate) struct AllocatorClient {
@@ -35,6 +35,7 @@ impl AllocatorClient {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub(crate) struct RegisterRequest {
     id: String,
+    port: u16
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -51,11 +52,11 @@ impl GenericResponse {
 
 #[async_trait]
 impl AllocatorInteractions for AllocatorClient {
-    async fn register(&self, id: String) -> Result<bool, Box<dyn Error>> {
+    async fn register(&self, id: String, port: u16) -> Result<bool, Box<dyn Error>> {
         let request_url = format!("{}/register", self.address);
         let resp = self.client
             .post(request_url)
-            .json(&RegisterRequest { id })
+            .json(&RegisterRequest { id, port })
             .send().await?;
         let data: GenericResponse = resp.json().await?;
         Ok(data.is_success())
@@ -88,7 +89,7 @@ mod tests {
             client,
             address: server.url(""),
         };
-        assert_eq!(true, allocator.register("random-id".to_string()).await.unwrap());
+        assert_eq!(true, allocator.register("random-id".to_string(), 3000).await.unwrap());
         registration_mock.assert();
     }
 
@@ -109,7 +110,7 @@ mod tests {
             client,
             address: server.url(""),
         };
-        assert_eq!(false, allocator.register("random-id".to_string()).await.unwrap());
+        assert_eq!(false, allocator.register("random-id".to_string(), 3000).await.unwrap());
         registration_mock.assert();
     }
 }

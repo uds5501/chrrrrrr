@@ -10,7 +10,7 @@ use rand::Rng;
 pub(crate) struct Node {
     store: RwLock<HashMap<String, String>>,
     key_count: AtomicU32,
-    id: String,
+    id: RwLock<String>,
 }
 
 fn get_node_id() -> String {
@@ -33,16 +33,15 @@ fn get_node_id() -> String {
 
 impl Node {
     pub fn new() -> Self {
-
         Self {
             store: RwLock::new(Default::default()),
             key_count: AtomicU32::new(0),
-            id: get_node_id()
+            id: RwLock::new(get_node_id()),
         }
     }
 
-    pub fn renew_id(&mut self) {
-        self.id = get_node_id()
+    pub fn renew_id(&self) {
+        *self.id.write().unwrap() = get_node_id();
     }
 
     pub fn insert_key(&self, key: String, val: String) -> bool {
@@ -86,7 +85,7 @@ impl Node {
     }
 
     pub fn get_id(&self) -> String {
-        self.id.clone()
+        self.id.read().unwrap().clone()
     }
 }
 

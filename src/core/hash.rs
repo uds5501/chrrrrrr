@@ -1,8 +1,9 @@
-use std::hash::{DefaultHasher, Hash, Hasher};
+use ahash::AHasher;
+use std::hash::Hasher;
 
 pub fn hash(str: &String, n: &u32) -> u32 {
-    let mut hasher = DefaultHasher::new();
-    str.hash(&mut hasher);
+    let mut hasher = AHasher::default();
+    hasher.write(str.as_bytes());
     let result = hasher.finish() as u32;
     result % n
 }
