@@ -14,6 +14,7 @@ pub(crate) trait NodeInteractions {
     async fn fetch_migrated(&self, start: u32, end: u32, n: u32) -> Result<Option<Arc<HashMap<String, String>>>, Box<dyn Error + Send + Sync>>;
 }
 
+#[derive(Debug)]
 pub(crate) struct NodeClient {
     client: Arc<Client>,
     address: String,

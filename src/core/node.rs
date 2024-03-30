@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{RwLock};
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::{AcqRel, Acquire};
+use log::debug;
 use crate::core::hash::hash;
 use rand::Rng;
 
@@ -12,27 +13,36 @@ pub(crate) struct Node {
     id: String,
 }
 
+fn get_node_id() -> String {
+    let mut rng = rand::thread_rng();
+    let node_id: String = (0..50)
+        .map(|_| {
+            let random_char = rng.gen_range(0..36);
+            if random_char < 26 {
+                // Generate an uppercase letter
+                (random_char + 65 as u8) as char
+            } else {
+                // Generate a digit
+                (random_char - 26 + 48 as u8) as char
+            }
+        })
+        .map(|c| c.to_string())
+        .collect();
+    node_id
+}
+
 impl Node {
     pub fn new() -> Self {
-        let mut rng = rand::thread_rng();
-        let node_id: String = (0..10)
-            .map(|_| {
-                let random_char = rng.gen_range(0..36);
-                if random_char < 26 {
-                    // Generate an uppercase letter
-                    (random_char + 65 as u8) as char
-                } else {
-                    // Generate a digit
-                    (random_char - 26 + 48 as u8) as char
-                }
-            })
-            .map(|c| c.to_string())
-            .collect();
+
         Self {
             store: RwLock::new(Default::default()),
             key_count: AtomicU32::new(0),
-            id: node_id
+            id: get_node_id()
         }
+    }
+
+    pub fn renew_id(&mut self) {
+        self.id = get_node_id()
     }
 
     pub fn insert_key(&self, key: String, val: String) -> bool {
@@ -65,6 +75,7 @@ impl Node {
         for (k, v) in hashmap.clone().iter() {
             let hash_val = hash(k, &n);
             if hash_val.clone() >= start && hash_val <= end {
+                debug!("migrating key : {} (hash - {})", k.clone(), hash_val);
                 cnt_remove += 1;
                 removed_hm.insert(String::from(k), String::from(v));
                 hashmap.remove(k);

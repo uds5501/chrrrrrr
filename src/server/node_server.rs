@@ -168,9 +168,32 @@ pub async fn main() {
     let alloc_client = Arc::new(Client::new());
     let allocator_client = AllocatorClient::new(alloc_client, server_url.clone());
 
-    let node = Arc::new(Node::new());
-    let node_for_registration = Arc::clone(&node);
-    let node_filter = warp::any().map(move || Arc::clone(&node));
+    let mut node = Node::new();
+
+    let mut retries = 10;
+    let mut is_registered = false;
+    while !is_registered {
+        match allocator_client.register(node.get_id(), port.clone()).await {
+            Ok(registered) => {
+                info!("Registration status - {registered}");
+                is_registered = registered;
+                if !registered {
+                    retries -= 1;
+                }
+            }
+            Err(e) => {
+                debug!("Some unexpected error occurred - {:?}", e);
+                if retries > 0 {
+                    retries -= 1;
+                    node.renew_id();
+                } else {
+                    panic!("Registration retries exhausted, registration failed!");
+                }
+            }
+        }
+    }
+    let node_ref = Arc::new(node);
+    let node_filter = warp::any().map(move || Arc::clone(&node_ref));
 
     // POST /insert
     let route_insert = warp::path("insert")
@@ -197,13 +220,5 @@ pub async fn main() {
 
     info!("Starting server at :{:?}", &port);
     info!("Registering to allocator ({:?})", &server_url);
-    match allocator_client.register(node_for_registration.get_id()).await {
-        Ok(registered) => {
-            info!("Registration status - {registered}");
-        }
-        Err(e) => {
-            debug!("Some unexpected error occurred - {:?}", e);
-        }
-    }
     warp::serve(routes).run(([127, 0, 0, 1], port)).await;
 }
