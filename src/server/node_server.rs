@@ -40,6 +40,16 @@ pub(crate) struct MigrateResponse {
     data: Option<HashMap<String, String>>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub(crate) struct GenericResponse {
+    success: bool,
+    message: String,
+}
+
+impl GenericResponse {
+    pub fn is_success(&self) -> bool {self.success}
+}
+
 impl MigrateResponse {
     pub fn is_success(&self) -> bool {
         self.success
@@ -146,6 +156,15 @@ async fn handle_migrate(req: MigrateRequest, node: Arc<Node>) -> Result<impl Rep
     Ok(warp::reply::json(&response))
 }
 
+async fn handle_health() -> Result<impl Reply, Rejection> {
+    let response = GenericResponse {
+        success: true,
+        message: "I am alive".to_string(),
+    };
+
+    Ok(warp::reply::json(&response))
+}
+
 fn json_body() -> impl Filter<Extract=(InsertRequest, ), Error=Rejection> + Clone {
     // When accepting a body, we want a JSON body
     // (and to reject huge payloads)...
@@ -193,10 +212,15 @@ pub async fn main() {
         .and(node_filter.clone())
         .and_then(handle_migrate);
 
+    let route_health = warp::path("health")
+        .and(warp::path::end())
+        .and_then(handle_health);
+
     // Combine routes and start the server
     let routes = route_insert
         .or(route_get)
-        .or(route_migrate);
+        .or(route_migrate)
+        .or(route_health);
 
     // Spawn a new task to start the server
     let server_task = tokio::spawn(async move {

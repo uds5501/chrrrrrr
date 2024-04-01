@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use reqwest::Client;
 use crate::errors::migration_error::MigrationError;
-use crate::server::node_server::{GetResponse, InsertRequest, InsertResponse, MigrateRequest, MigrateResponse};
+use crate::server::node_server::{GenericResponse, GetResponse, InsertRequest, InsertResponse, MigrateRequest, MigrateResponse};
 use crate::errors::node_get_error::NodeGetError;
 
 #[async_trait]
@@ -12,6 +12,7 @@ pub(crate) trait NodeInteractions {
     async fn insert_key(&self, key: String, val: String) -> Result<bool, Box<dyn Error>>;
     async fn get(&self, key: String) -> Result<String, Box<dyn Error>>;
     async fn fetch_migrated(&self, start: u32, end: u32, n: u32) -> Result<Option<Arc<HashMap<String, String>>>, Box<dyn Error + Send + Sync>>;
+    async fn health_check(&self) -> Result<bool, Box<dyn Error>>;
 }
 
 #[derive(Debug)]
@@ -86,6 +87,18 @@ impl NodeInteractions for NodeClient {
             };
         }
         Err(Box::new(MigrationError::new(response_json.get_msg())))
+    }
+
+    async fn health_check(&self) -> Result<bool, Box<dyn Error>> {
+        let request_url = format!("{}/health", self.address);
+        let resp = self.client
+            .get(request_url)
+            .send().await?;
+        let data: GenericResponse = resp.json().await?;
+        if data.is_success() {
+            return Ok(true);
+        }
+        Ok(false)
     }
 }
 
@@ -185,6 +198,51 @@ mod tests {
         };
         let actual = node.get("foo".to_string()).await.unwrap_err();
         assert_eq!("Node fetch failed with error: Key not present".to_string(), actual.to_string());
+        get_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_health_call_succeeds() {
+        let server = MockServer::start();
+
+        let insert_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/health");
+            then.status(200)
+                .header("content-type", "JSON")
+                .json_body(json!({"success": true, "message": "Key present"}));
+        });
+
+        let client = Arc::new(Client::new());
+        let node = NodeClient {
+            client,
+            address: server.url(""),
+            id: "0".to_string(),
+        };
+        assert_eq!(true, node.health_check().await.unwrap());
+        insert_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_health_call_fails() {
+        let server = MockServer::start();
+
+        let get_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/health");
+            then.status(200)
+                .header("content-type", "JSON")
+                .json_body(json!({"success": false, "message": "Key not present"}));
+        });
+
+        let client = Arc::new(Client::new());
+        let node = NodeClient {
+            client,
+            address: server.url(""),
+            id: "0".to_string(),
+        };
+        let actual = node.health_check().await.unwrap();
+        assert_eq!(false, actual);
         get_mock.assert();
     }
 
