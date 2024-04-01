@@ -157,6 +157,7 @@ async fn handle_migrate(req: MigrateRequest, node: Arc<Node>) -> Result<impl Rep
 }
 
 async fn handle_health() -> Result<impl Reply, Rejection> {
+    debug!("ping.");
     let response = GenericResponse {
         success: true,
         message: "I am alive".to_string(),

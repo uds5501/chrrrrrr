@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 use async_trait::async_trait;
-use reqwest::Client;
+use log::debug;
+use reqwest::{Client, Response};
 use crate::errors::migration_error::MigrationError;
 use crate::server::node_server::{GenericResponse, GetResponse, InsertRequest, InsertResponse, MigrateRequest, MigrateResponse};
 use crate::errors::node_get_error::NodeGetError;
@@ -91,11 +92,23 @@ impl NodeInteractions for NodeClient {
 
     async fn health_check(&self) -> Result<bool, Box<dyn Error>> {
         let request_url = format!("{}/health", self.address);
-        let resp = self.client
+        let resp: Response = match self.client
             .get(request_url)
-            .send().await?;
-        let data: GenericResponse = resp.json().await?;
-        if data.is_success() {
+            .send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                debug!("connection failed with -> {:?}", e);
+                return Ok(false);
+            }
+        };
+        let response: GenericResponse = match resp.json().await {
+            Ok(data) => data,
+            Err(_) => {
+                return Ok(false);
+            }
+        };
+
+        if response.is_success() {
             return Ok(true);
         }
         Ok(false)

@@ -1,12 +1,14 @@
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use warp::{Filter, Rejection, Reply};
 use crate::core::allocator::{Allocator, RegistrationInteractions, StorageInteractions};
 use dns_lookup::lookup_addr;
 use reqwest::Client;
+use tokio::time::sleep;
 use crate::clients::node_client::NodeClient;
 
 
@@ -180,6 +182,7 @@ pub async fn main() {
     };
 
     let allocator = Arc::new(Allocator::new(slots));
+    let health_alloc = Arc::clone(&allocator);
     let client = Arc::new(Client::new());
     let allocator_filter = warp::any().map(move || Arc::clone(&allocator));
     let client_filter = warp::any().map(move || Arc::clone(&client));
@@ -210,6 +213,20 @@ pub async fn main() {
         .or(route_get)
         .or(route_register);
 
-    info!("Starting server at :{port}");
-    warp::serve(routes).run(([127, 0, 0, 1], port)).await;
+    let server_task = tokio::spawn(async move {
+        info!("Starting server at :{:?}", &port);
+        warp::serve(routes).run(([127, 0, 0, 1], port)).await;
+    });
+
+    tokio::join!(
+        async {
+            sleep(Duration::new(1, 0)).await;
+            info!("Init -> healthcheck thread");
+            loop {
+                sleep(Duration::new(2, 0)).await;
+                debug!("Performing health check..");
+                health_alloc.healthcheck().await.unwrap();
+            }
+        }
+    );
 }

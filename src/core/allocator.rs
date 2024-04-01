@@ -207,7 +207,15 @@ impl RegistrationInternals for Allocator {
         let slot_to_remove = hash(&node.get_id(), &metadata.total_slots);
 
         let old_node_idx = metadata.identify_nearest_idx_anti_clockwise(slot_to_remove);
-        let new_node_idx = &((old_node_idx - 1) as u32 % metadata.total_slots);
+        let mut new_node_idx = old_node_idx;
+        // because old - 1 is throwing overflow error.
+        if old_node_idx + 1 == 1 {
+            new_node_idx = metadata.acquired_slots.len() - 1;
+        } else {
+            new_node_idx -= 1;
+        }
+
+        let new_node_idx = &(new_node_idx as u32);
         // if it's not the only element.
         if metadata.acquired_slots.len() != 0 {
             let new_node = metadata.slot_node_map.get(&metadata.acquired_slots[*new_node_idx as usize]).unwrap();
@@ -229,8 +237,7 @@ impl RegistrationInternals for Allocator {
                         }
                     }
                     Err(e) => {
-                        debug!("Some error occurred when fetching migration keys");
-                        return Err(e);
+                        debug!("Some error occurred when fetching migration keys,{:?}", e);
                     }
                 }
             }
